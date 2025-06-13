@@ -4,6 +4,10 @@ import requests
 import psycopg2
 from pgvector.psycopg2 import register_vector
 from datetime import datetime
+from bs4 import BeautifulSoup
+import re
+import uuid
+import time
 
 # --- 1. CONFIGURATION ---
 # --- Fill in your details here ---
@@ -14,63 +18,133 @@ BOOKSTACK_TOKEN_ID = "mVibdoYPZyjuNGkzfV2jlqJXIQ9NXXN0"
 BOOKSTACK_TOKEN_SECRET = "TMvvKQoGeQeKn1OZKvzHG2Nb6Zvbb1ph"
 
 # Ollama Configuration
-OLLAMA_HOST = "http://jerry-ollama.abelcine.com:11434"
-OLLAMA_MODEL = "mxbai-embed-large"
-EMBEDDING_DIMENSION = 1024
+# OLLAMA_HOST = "http://jerry-ollama.abelcine.com:11434"
+OLLAMA_HOST = "http://192.168.10.248:11434"
+OLLAMA_MODEL = "nomic-embed-text:v1.5"
+EMBEDDING_DIMENSION = 768
 
 # PostgreSQL Configuration
 DB_CONNECTION_STRING = "postgresql://flowisedbuser:O7Q6ox3xFEQPDX4ZEuqvHzXKLaf29iTr@jerry-docker1.abelcine.com:5432/flowise-db"
-DB_TABLE_NAME = "abelcinewiki"
+DOCS_TABLE_NAME = "upserted_docs"
+RECORDS_TABLE_NAME = "upsertion_records"
+
+# Flowise Configuration
+NAMESPACE = "abelcine_wiki_documents"  # Customize your namespace
+GROUP_ID = None  # Set to a string if you want to group documents
+
+# Text Processing Configuration
+ENABLE_CHUNKING = True  # Set to True if you want to split pages into chunks
+CHUNK_SIZE = 500  # Words per chunk
+CHUNK_OVERLAP = 50  # Words of overlap between chunks
+
+def preprocess_bookstack_html(raw_html: str) -> str:
+    """Extract clean text content from BookStack HTML."""
+    if not raw_html:
+        return ""
+
+    soup = BeautifulSoup(raw_html, 'html.parser')
+
+    # Remove navigation, sidebar, footer elements
+    for elem in soup.find_all(['nav', 'aside', 'footer', 'script', 'style']):
+        elem.decompose()
+
+    # Remove common BookStack UI elements
+    for selector in ['.page-nav', '.sidebar', '.header', '.breadcrumbs', '.bkmrk']:
+        for elem in soup.select(selector):
+            elem.decompose()
+
+    # Get main content (adjust selector based on BookStack structure)
+    main_content = soup.find('main') or soup.find('.page-content') or soup
+
+    # Extract clean text
+    text = main_content.get_text(separator=' ', strip=True)
+    return re.sub(r'\s+', ' ', text)  # Normalize whitespace
 
 
-def setup_database(conn, force_recreate=False):
-    """Enables pgvector and creates the table if it doesn't exist."""
-    print("Setting up table...")
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+    """Split text into overlapping chunks."""
+    if not text:
+        return []
+
+    words = text.split()
+    if len(words) <= chunk_size:
+        return [text]  # No need to chunk
+
+    chunks = []
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk_words = words[i:i + chunk_size]
+        chunk = ' '.join(chunk_words)
+        chunks.append(chunk)
+
+        # Stop if we've reached the end
+        if i + chunk_size >= len(words):
+            break
+
+    return chunks
+
+
+def setup_database(conn, force_recreate=True):
+    """Creates Flowise-compatible tables."""
+    print("Setting up Flowise-compatible tables...")
     try:
         cur = conn.cursor()
+
+        # Enable required extensions
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        cur.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
         conn.commit()
 
         if force_recreate:
-            print(
-                f"Dropping existing table {DB_TABLE_NAME} to recreate with new schema..."
-            )
-            cur.execute(f"DROP TABLE IF EXISTS {DB_TABLE_NAME};")
+            print(f"Dropping existing tables to recreate with Flowise schema...")
+            cur.execute(f"DROP TABLE IF EXISTS {RECORDS_TABLE_NAME};")
+            cur.execute(f"DROP TABLE IF EXISTS {DOCS_TABLE_NAME};")
             conn.commit()
 
-        create_table_query = f"""
-        CREATE TABLE IF NOT EXISTS {DB_TABLE_NAME} (
-            id INT PRIMARY KEY,
-            book_id INT,
-            chapter_id INT,
-            name TEXT,
-            slug TEXT,
-            content TEXT,
-            content_type VARCHAR(10) DEFAULT 'html',
-            created_at TIMESTAMPTZ,
-            updated_at TIMESTAMPTZ,
-            created_by JSONB,
-            updated_by JSONB,
+        # Create upserted_docs table (main content table)
+        create_docs_table_query = f"""
+        CREATE TABLE IF NOT EXISTS {DOCS_TABLE_NAME} (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            "pageContent" TEXT NOT NULL,
             metadata JSONB,
-            embedding vector({EMBEDDING_DIMENSION}),
-            processed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            embedding vector({EMBEDDING_DIMENSION})
         );
         """
-        cur.execute(create_table_query)
+        cur.execute(create_docs_table_query)
         conn.commit()
 
+        # Create upsertion_records table (tracking table)
+        create_records_table_query = f"""
+        CREATE TABLE IF NOT EXISTS {RECORDS_TABLE_NAME} (
+            uuid UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            key TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            updated_at DOUBLE PRECISION NOT NULL,
+            group_id TEXT
+        );
+        """
+        cur.execute(create_records_table_query)
+        conn.commit()
+
+        # Create indexes for better performance
         index_queries = [
-            f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE_NAME}_book_id ON {DB_TABLE_NAME}(book_id);",
-            f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE_NAME}_updated_at ON {DB_TABLE_NAME}(updated_at);",
+            f"CREATE INDEX IF NOT EXISTS idx_{DOCS_TABLE_NAME}_embedding ON {DOCS_TABLE_NAME} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);",
+            f"CREATE INDEX IF NOT EXISTS idx_{RECORDS_TABLE_NAME}_namespace ON {RECORDS_TABLE_NAME}(namespace);",
+            f"CREATE INDEX IF NOT EXISTS idx_{RECORDS_TABLE_NAME}_key ON {RECORDS_TABLE_NAME}(key);",
+            f"CREATE INDEX IF NOT EXISTS idx_{RECORDS_TABLE_NAME}_updated_at ON {RECORDS_TABLE_NAME}(updated_at);",
         ]
 
         for index_query in index_queries:
-            cur.execute(index_query)
-            conn.commit()
+            try:
+                cur.execute(index_query)
+                conn.commit()
+            except Exception as e:
+                print(f"Note: Could not create index (may require more data): {e}")
 
         cur.close()
         table_action = "recreated" if force_recreate else "verified"
-        print(f"Database setup complete. Table '{DB_TABLE_NAME}' {table_action}.")
+        print(f"Flowise tables {table_action}.")
+        print(f"Namespace: {NAMESPACE}")
+        print(f"Chunking enabled: {ENABLE_CHUNKING}")
         return force_recreate
     except Exception as e:
         print(f"Error during database setup: {e}")
@@ -102,31 +176,28 @@ def get_all_bookstack_pages():
     }
     all_pages = []
     page = 1
-    max_pages_per_request = 500  # Try larger batch size
+    max_pages_per_request = 500
     consecutive_empty_pages = 0
-    max_empty_pages = 3  # Stop after 3 consecutive empty responses
+    max_empty_pages = 3
 
     print("Starting to fetch all BookStack pages...")
 
     while True:
-        # Try larger count first, fall back to 100 if it fails
         for count in [max_pages_per_request, 100]:
             url = f"{BOOKSTACK_URL}/api/pages?page={page}&count={count}"
             print(f"\n--- API Call: Page {page}, requesting {count} items ---")
-            print(f"URL: {url}")
 
             try:
                 response = requests.get(url, headers=headers, timeout=30)
                 response.raise_for_status()
                 data = response.json()
-                break  # Success, exit the count retry loop
+                break
             except Exception as e:
                 print(f"Failed with count={count}: {e}")
-                if count == 100:  # If even 100 fails, raise the error
+                if count == 100:
                     raise
-                continue  # Try with smaller count
+                continue
 
-        # Debug pagination info
         print("API Response structure:")
         for key, value in data.items():
             if key != "data":
@@ -144,14 +215,12 @@ def get_all_bookstack_pages():
             consecutive_empty_pages += 1
             print(f"Empty response #{consecutive_empty_pages}")
             if consecutive_empty_pages >= max_empty_pages:
-                print(f"Stopping after {max_empty_pages} consecutive empty responses")
                 break
         else:
             consecutive_empty_pages = 0
             all_pages.extend(pages)
             print(f"Added {len(pages)} pages. Total so far: {len(all_pages)}")
 
-        # Check various stopping conditions
         should_stop = False
         if last_page is not None and current_page >= last_page:
             print(f"Reached last page: {current_page}/{last_page}")
@@ -168,11 +237,8 @@ def get_all_bookstack_pages():
 
         page += 1
 
-        # Increased safety valve - adjust as needed
-        if page > 100:  # Allow up to 100 API calls (10,000+ pages)
-            print(
-                f"Safety stop: More than 100 API pages. If you have more pages, increase this limit."
-            )
+        if page > 100:
+            print(f"Safety stop: More than 100 API pages.")
             break
 
     print(f"\n=== Pagination Complete: Found {len(all_pages)} total pages ===")
@@ -207,21 +273,123 @@ def parse_bookstack_datetime(datetime_str):
         return None
 
 
+def insert_page_chunks_flowise(cur, page_details, clean_text, conn):
+    """Insert page content into Flowise-compatible tables."""
+    page_id = page_details["id"]
+    page_name = page_details["name"]
+    current_timestamp = time.time()  # Unix timestamp as float
+
+    # Create a key for this page (used in upsertion_records)
+    base_key = f"bookstack_page_{page_id}"
+
+    # Delete existing records for this page from both tables
+    cur.execute(f"DELETE FROM {RECORDS_TABLE_NAME} WHERE key LIKE %s", (f"{base_key}%",))
+
+    # Get existing doc IDs to delete
+    cur.execute(
+        f"SELECT id FROM {DOCS_TABLE_NAME} WHERE metadata->>'page_id' = %s",
+        (str(page_id),)
+    )
+    existing_doc_ids = [row[0] for row in cur.fetchall()]
+
+    if existing_doc_ids:
+        placeholders = ','.join(['%s'] * len(existing_doc_ids))
+        cur.execute(f"DELETE FROM {DOCS_TABLE_NAME} WHERE id IN ({placeholders})", existing_doc_ids)
+
+    if ENABLE_CHUNKING:
+        chunks = chunk_text(clean_text, CHUNK_SIZE, CHUNK_OVERLAP)
+        print(f"  → Split into {len(chunks)} chunks")
+    else:
+        chunks = [clean_text]
+        print(f"  → Processing as single entry")
+
+    successful_inserts = 0
+    inserted_doc_ids = []
+
+    for chunk_index, chunk_content in enumerate(chunks):
+        if not chunk_content.strip():
+            continue
+
+        try:
+            # Generate UUIDs
+            doc_uuid = str(uuid.uuid4())
+            record_uuid = str(uuid.uuid4())
+
+            # Generate embedding for this chunk
+            embedding = get_embedding(chunk_content)
+
+            # Create metadata for the document
+            doc_metadata = {
+                "source": f"{BOOKSTACK_URL}/books/{page_details.get('book', {}).get('slug', 'unknown')}/page/{page_details.get('slug', 'unknown')}",
+                "page_id": str(page_id),
+                "page_name": page_name,
+                "book_id": str(page_details.get("book_id", "")),
+                "book_name": page_details.get("book", {}).get("name", ""),
+                "book_slug": page_details.get("book", {}).get("slug", ""),
+                "chapter_id": str(page_details.get("chapter_id", "")) if page_details.get("chapter_id") else None,
+                "chapter_name": page_details.get("chapter", {}).get("name") if page_details.get("chapter") else None,
+                "slug": page_details.get("slug", ""),
+                "created_at": page_details.get("created_at", ""),
+                "updated_at": page_details.get("updated_at", ""),
+                "chunk_index": chunk_index,
+                "total_chunks": len(chunks),
+                "word_count": len(chunk_content.split()),
+                "priority": page_details.get("priority"),
+                "template": page_details.get("template", False),
+                "revision_count": page_details.get("revision_count", 0),
+                "editor": page_details.get("editor", ""),
+                "draft": page_details.get("draft", False),
+            }
+
+            # Insert into upserted_docs table
+            docs_insert_query = f"""
+            INSERT INTO {DOCS_TABLE_NAME} (id, "pageContent", metadata, embedding)
+            VALUES (%s, %s, %s, %s)
+            """
+
+            cur.execute(
+                docs_insert_query,
+                (doc_uuid, chunk_content, json.dumps(doc_metadata), embedding)
+            )
+
+            # Create key for this specific chunk
+            chunk_key = f"{base_key}_chunk_{chunk_index}" if ENABLE_CHUNKING else base_key
+
+            # Insert into upsertion_records table
+            records_insert_query = f"""
+            INSERT INTO {RECORDS_TABLE_NAME} (uuid, key, namespace, updated_at, group_id)
+            VALUES (%s, %s, %s, %s, %s)
+            """
+
+            cur.execute(
+                records_insert_query,
+                (record_uuid, chunk_key, NAMESPACE, current_timestamp, GROUP_ID)
+            )
+
+            successful_inserts += 1
+            inserted_doc_ids.append(doc_uuid)
+
+        except Exception as e:
+            print(f"  → Failed to process chunk {chunk_index}: {e}")
+            continue
+
+    conn.commit()
+    return successful_inserts, inserted_doc_ids
+
+
 def main():
-    """Main function to run the ETL process with detailed tracking."""
+    """Main function to run the ETL process with Flowise schema."""
     print("Connecting to the database...")
 
     conn = psycopg2.connect(DB_CONNECTION_STRING)
     register_vector(conn)
 
-    # Track all processing results
     processing_log = {
         "successful": [],
         "skipped": [],
         "failed_fetch": [],
         "failed_no_content": [],
-        "failed_embedding": [],
-        "failed_database": [],
+        "failed_processing": [],
     }
 
     try:
@@ -234,30 +402,14 @@ def main():
 
         cur = conn.cursor()
         total_pages = len(pages)
+        total_chunks_inserted = 0
+        all_inserted_doc_ids = []
 
         for i, page_summary in enumerate(pages):
             page_id = page_summary["id"]
             page_name = page_summary["name"]
-            page_updated_at = page_summary.get("updated_at")
 
             print(f"\n[{i+1}/{total_pages}] Processing: '{page_name}' (ID: {page_id})")
-
-            # Since we recreated the table, all pages need to be processed
-            if not table_was_recreated:
-                # Only check for updates if we didn't recreate the table
-                cur.execute(
-                    f"SELECT updated_at FROM {DB_TABLE_NAME} WHERE id = %s", (page_id,)
-                )
-                result = cur.fetchone()
-                if result:
-                    db_updated_at = result[0]
-                    page_timestamp = parse_bookstack_datetime(page_updated_at)
-                    if page_timestamp and page_timestamp <= db_updated_at:
-                        print("  → SKIPPED (up to date)")
-                        processing_log["skipped"].append(
-                            {"id": page_id, "name": page_name}
-                        )
-                        continue
 
             # Fetch page details
             print("  → Fetching details...")
@@ -269,127 +421,103 @@ def main():
                 )
                 continue
 
-            # Check for content
-            content = page_details.get("html", "")
-            if not content:
+            # Extract and clean HTML content
+            raw_html = page_details.get("html", "")
+            if not raw_html:
                 print("  → FAILED (no HTML content)")
                 processing_log["failed_no_content"].append(
                     {"id": page_id, "name": page_name}
                 )
                 continue
 
-            # Generate embedding
-            try:
-                print("  → Generating embedding...")
-                embedding = get_embedding(content)
-            except Exception as e:
-                print(f"  → FAILED (embedding error): {e}")
-                processing_log["failed_embedding"].append(
-                    {"id": page_id, "name": page_name, "error": str(e)}
+            print("  → Cleaning HTML...")
+            clean_text = preprocess_bookstack_html(raw_html)
+
+            if not clean_text.strip():
+                print("  → FAILED (no text content after cleaning)")
+                processing_log["failed_no_content"].append(
+                    {"id": page_id, "name": page_name}
                 )
                 continue
 
-            # Insert into database
+            print(f"  → Extracted {len(clean_text.split())} words")
+
+            # Process and insert chunks
             try:
-                print("  → Inserting into database...")
+                chunks_inserted, doc_ids = insert_page_chunks_flowise(cur, page_details, clean_text, conn)
+                total_chunks_inserted += chunks_inserted
+                all_inserted_doc_ids.extend(doc_ids)
 
-                metadata = {
-                    "source": f"{BOOKSTACK_URL}/books/{page_details.get('book', {}).get('slug', 'unknown')}/page/{page_details.get('slug', 'unknown')}",
-                    "book_name": page_details.get("book", {}).get("name"),
-                    "book_slug": page_details.get("book", {}).get("slug"),
-                    "chapter_name": page_details.get("chapter", {}).get("name")
-                    if page_details.get("chapter")
-                    else None,
-                    "priority": page_details.get("priority"),
-                    "template": page_details.get("template"),
-                    "revision_count": page_details.get("revision_count", 0),
-                    "editor": page_details.get("editor"),
-                    "draft": page_details.get("draft"),
-                }
-
-                upsert_query = f"""
-                INSERT INTO {DB_TABLE_NAME} (
-                    id, book_id, chapter_id, name, slug, content, content_type,
-                    created_at, updated_at, created_by, updated_by, metadata, embedding
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (id) DO UPDATE SET
-                    book_id = EXCLUDED.book_id,
-                    chapter_id = EXCLUDED.chapter_id,
-                    name = EXCLUDED.name,
-                    slug = EXCLUDED.slug,
-                    content = EXCLUDED.content,
-                    content_type = EXCLUDED.content_type,
-                    created_at = EXCLUDED.created_at,
-                    updated_at = EXCLUDED.updated_at,
-                    created_by = EXCLUDED.created_by,
-                    updated_by = EXCLUDED.updated_by,
-                    metadata = EXCLUDED.metadata,
-                    embedding = EXCLUDED.embedding,
-                    processed_at = CURRENT_TIMESTAMP;
-                """
-
-                cur.execute(
-                    upsert_query,
-                    (
-                        page_id,
-                        page_details.get("book_id"),
-                        page_details.get("chapter_id"),
-                        page_details.get("name"),
-                        page_details.get("slug"),
-                        content,
-                        "html",
-                        parse_bookstack_datetime(page_details.get("created_at")),
-                        parse_bookstack_datetime(page_details.get("updated_at")),
-                        json.dumps(page_details.get("created_by", {})),
-                        json.dumps(page_details.get("updated_by", {})),
-                        json.dumps(metadata),
-                        embedding,
-                    ),
-                )
-                conn.commit()
-                print("  → SUCCESS")
-                processing_log["successful"].append(
-                    {"id": page_id, "name": page_name}
-                )
+                if chunks_inserted > 0:
+                    print(f"  → SUCCESS ({chunks_inserted} chunks inserted)")
+                    processing_log["successful"].append(
+                        {
+                            "id": page_id,
+                            "name": page_name,
+                            "chunks": chunks_inserted,
+                            "doc_ids": doc_ids
+                        }
+                    )
+                else:
+                    print("  → FAILED (no chunks inserted)")
+                    processing_log["failed_processing"].append(
+                        {"id": page_id, "name": page_name}
+                    )
 
             except Exception as e:
-                print(f"  → FAILED (database error): {e}")
-                processing_log["failed_database"].append(
+                print(f"  → FAILED (processing error): {e}")
+                processing_log["failed_processing"].append(
                     {"id": page_id, "name": page_name, "error": str(e)}
                 )
                 continue
 
         # Final report
-        cur.execute(f"SELECT COUNT(*) FROM {DB_TABLE_NAME}")
-        final_db_count = cur.fetchone()[0]
+        cur.execute(f"SELECT COUNT(*) FROM {DOCS_TABLE_NAME}")
+        final_docs_count = cur.fetchone()[0]
+
+        cur.execute(f"SELECT COUNT(*) FROM {RECORDS_TABLE_NAME}")
+        final_records_count = cur.fetchone()[0]
+
+        cur.execute(f"SELECT COUNT(DISTINCT metadata->>'page_id') FROM {DOCS_TABLE_NAME}")
+        unique_pages_count = cur.fetchone()[0]
+
+        # Sample a few IDs to verify
+        cur.execute(f"SELECT id FROM {DOCS_TABLE_NAME} LIMIT 3")
+        sample_doc_ids = [row[0] for row in cur.fetchall()]
+
+        cur.execute(f"SELECT uuid FROM {RECORDS_TABLE_NAME} LIMIT 3")
+        sample_record_ids = [row[0] for row in cur.fetchall()]
+
         cur.close()
 
         print(f"\n{'='*60}")
-        print("FINAL PROCESSING REPORT")
+        print("FINAL PROCESSING REPORT (Flowise Schema)")
         print(f"{'='*60}")
         print(f"Total pages found in API: {total_pages}")
-        print(f"Successfully processed: {len(processing_log['successful'])}")
-        print(f"Skipped (up to date): {len(processing_log['skipped'])}")
+        print(f"Successfully processed pages: {len(processing_log['successful'])}")
+        print(f"Total chunks/entries inserted: {total_chunks_inserted}")
         print(f"Failed to fetch details: {len(processing_log['failed_fetch'])}")
         print(f"Failed (no content): {len(processing_log['failed_no_content'])}")
-        print(f"Failed (embedding): {len(processing_log['failed_embedding'])}")
-        print(f"Failed (database): {len(processing_log['failed_database'])}")
-        print(f"Final database count: {final_db_count}")
+        print(f"Failed (processing): {len(processing_log['failed_processing'])}")
+        print(f"Final {DOCS_TABLE_NAME} count: {final_docs_count} entries")
+        print(f"Final {RECORDS_TABLE_NAME} count: {final_records_count} entries")
+        print(f"Unique pages in database: {unique_pages_count}")
+        print(f"Namespace: {NAMESPACE}")
+        print(f"Sample doc UUIDs: {sample_doc_ids}")
+        print(f"Sample record UUIDs: {sample_record_ids}")
 
         # Show detailed failures
         for category, failures in processing_log.items():
             if failures and "failed" in category:
                 print(f"\n{category.upper().replace('_', ' ')}:")
-                for failure in failures[:10]:  # Show first 10
+                for failure in failures[:5]:
                     print(f"  - ID {failure['id']}: {failure['name']}")
-                if len(failures) > 10:
-                    print(f"  ... and {len(failures) - 10} more")
+                if len(failures) > 5:
+                    print(f"  ... and {len(failures) - 5} more")
 
     except Exception as e:
         print(f"\nCritical error: {e}")
         import traceback
-
         traceback.print_exc()
     finally:
         if conn:
