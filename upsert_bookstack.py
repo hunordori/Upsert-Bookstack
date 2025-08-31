@@ -8,34 +8,40 @@ from bs4 import BeautifulSoup
 import re
 import uuid
 import time
+from dotenv import load_dotenv
 
-# --- 1. CONFIGURATION ---
-# --- Fill in your details here ---
+# --- CONFIGURATION ---
+load_dotenv()
 
 # BookStack Configuration
-BOOKSTACK_URL = "https://wiki.abelcine.com"  # Your BookStack base URL
-BOOKSTACK_TOKEN_ID = "mVibdoYPZyjuNGkzfV2jlqJXIQ9NXXN0"
-BOOKSTACK_TOKEN_SECRET = "TMvvKQoGeQeKn1OZKvzHG2Nb6Zvbb1ph"
+BOOKSTACK_URL = os.getenv("BOOKSTACK_URL")
+BOOKSTACK_TOKEN_ID = os.getenv("BOOKSTACK_TOKEN_ID")
+BOOKSTACK_TOKEN_SECRET = os.getenv("BOOKSTACK_TOKEN_SECRET")
 
 # Ollama Configuration
-# OLLAMA_HOST = "http://jerry-ollama.abelcine.com:11434"
-OLLAMA_HOST = "http://192.168.10.248:11434"
-OLLAMA_MODEL = "nomic-embed-text:v1.5"
-EMBEDDING_DIMENSION = 768
+OLLAMA_HOST = os.getenv("OLLAMA_HOST")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL")
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION"))
 
 # PostgreSQL Configuration
-DB_CONNECTION_STRING = "postgresql://flowisedbuser:O7Q6ox3xFEQPDX4ZEuqvHzXKLaf29iTr@jerry-docker1.abelcine.com:5432/flowise-db"
-DOCS_TABLE_NAME = "upserted_docs"
-RECORDS_TABLE_NAME = "upsertion_records"
+DB_CONNECTION_STRING = os.getenv("DB_CONNECTION_STRING")
+DOCS_TABLE_NAME = os.getenv("DOCS_TABLE_NAME")
+RECORDS_TABLE_NAME = os.getenv("RECORDS_TABLE_NAME")
 
 # Flowise Configuration
-NAMESPACE = "abelcine_wiki_documents"  # Customize your namespace
-GROUP_ID = None  # Set to a string if you want to group documents
+NAMESPACE = os.getenv("NAMESPACE")
+GROUP_ID = os.getenv("GROUP_ID")
 
 # Text Processing Configuration
-ENABLE_CHUNKING = True  # Set to True if you want to split pages into chunks
-CHUNK_SIZE = 500  # Words per chunk
-CHUNK_OVERLAP = 50  # Words of overlap between chunks
+ENABLE_CHUNKING = os.getenv("ENABLE_CHUNKING")
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP"))
+EXCLUDED_SHELF_IDS = os.getenv("EXCLUDED_SHELF_IDS", "").split(",") if os.getenv("EXCLUDED_SHELF_IDS") else []
+EXCLUDED_SHELF_IDS = [int(id.strip()) for id in EXCLUDED_SHELF_IDS if id.strip().isdigit()]
+
+# Cache for book details to avoid repeated API calls
+book_cache = {}
+
 
 def preprocess_bookstack_html(raw_html: str) -> str:
     """Extract clean text content from BookStack HTML."""
@@ -49,11 +55,11 @@ def preprocess_bookstack_html(raw_html: str) -> str:
         elem.decompose()
 
     # Remove common BookStack UI elements
-    for selector in ['.page-nav', '.sidebar', '.header', '.breadcrumbs', '.bkmrk']:
+    for selector in ['.page-nav', '.sidebar', '.header', '.breadcrumbs']:
         for elem in soup.select(selector):
             elem.decompose()
 
-    # Get main content (adjust selector based on BookStack structure)
+    # Get main content
     main_content = soup.find('main') or soup.find('.page-content') or soup
 
     # Extract clean text
@@ -68,7 +74,7 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]
 
     words = text.split()
     if len(words) <= chunk_size:
-        return [text]  # No need to chunk
+        return [text]
 
     chunks = []
     for i in range(0, len(words), chunk_size - overlap):
@@ -76,12 +82,119 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]
         chunk = ' '.join(chunk_words)
         chunks.append(chunk)
 
-        # Stop if we've reached the end
         if i + chunk_size >= len(words):
             break
 
     return chunks
 
+
+def get_book_details(book_id):
+    """Fetch book details from the books API with caching."""
+    if book_id in book_cache:
+        return book_cache[book_id]
+
+    headers = {
+        "Authorization": f"Token {BOOKSTACK_TOKEN_ID}:{BOOKSTACK_TOKEN_SECRET}"
+    }
+    url = f"{BOOKSTACK_URL}/api/books/{book_id}"
+
+    try:
+        print(f"    → Fetching book details for book ID {book_id}...")
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        book_data = response.json()
+
+        # Cache the book details
+        book_cache[book_id] = book_data
+        print(f"    → Cached book: '{book_data.get('name', 'Unknown')}' (slug: {book_data.get('slug', 'unknown')})")
+        return book_data
+    except Exception as e:
+        print(f"    → Error fetching book details for book ID {book_id}: {e}")
+        # Return a fallback book object
+        fallback = {
+            "id": book_id,
+            "name": f"Book {book_id}",
+            "slug": f"book-{book_id}",
+            "description": "",
+        }
+        book_cache[book_id] = fallback
+        return fallback
+
+
+def get_chapter_details(chapter_id):
+    """Fetch chapter details from the chapters API (if needed)."""
+    if not chapter_id or chapter_id == 0:
+        return None
+
+    headers = {
+        "Authorization": f"Token {BOOKSTACK_TOKEN_ID}:{BOOKSTACK_TOKEN_SECRET}"
+    }
+    url = f"{BOOKSTACK_URL}/api/chapters/{chapter_id}"
+
+    try:
+        print(f"    → Fetching chapter details for chapter ID {chapter_id}...")
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"    → Error fetching chapter details for chapter ID {chapter_id}: {e}")
+        return None
+
+# --- Shelves support: build a book_id -> shelves map and expose a simple fetch_all pager ---
+from urllib.parse import urljoin
+
+def _bookstack_auth_header():
+    return {"Authorization": f"Token {BOOKSTACK_TOKEN_ID}:{BOOKSTACK_TOKEN_SECRET}", "Accept": "application/json"}
+
+def fetch_all(session: requests.Session, path: str, params=None):
+    """Yield all items from a paginated BookStack endpoint like /api/shelves."""
+    params = dict(params or {})
+    page = 1
+    while True:
+        params["page"] = page
+        r = session.get(urljoin(BOOKSTACK_URL.rstrip('/') + '/', path.lstrip('/')), headers=_bookstack_auth_header(), params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("data") or data.get("items") or []
+        for it in items:
+            yield it
+        cur = data.get("current_page")
+        last = data.get("last_page")
+        if not cur or not last or cur >= last:
+            break
+        page += 1
+
+def build_book_to_shelves_map(session: requests.Session):
+    """
+    Returns a dict mapping book_id -> list of shelves ({id, name, slug}).
+    Uses /api/shelves (list). If a shelf item lacks 'books', falls back to /api/shelves/{id}.
+    """
+    book_to_shelves = {}
+    # Iterate shelves with pagination
+    for shelf in fetch_all(session, "/api/shelves"):
+        shelf_id = shelf.get("id")
+        if shelf_id is None:
+            continue
+        shelf_name = shelf.get("name")
+        shelf_slug = shelf.get("slug")
+
+        books = shelf.get("books")
+        # Fallback: fetch shelf detail to get books array if not included on list item
+        if books is None:
+            r = session.get(urljoin(BOOKSTACK_URL.rstrip('/') + '/', f"/api/shelves/{shelf_id}"), headers=_bookstack_auth_header(), timeout=30)
+            r.raise_for_status()
+            detail = r.json()
+            books = detail.get("books", [])
+
+        for b in (books or []):
+            bid = b.get("id")
+            if bid is None:
+                continue
+            book_to_shelves.setdefault(bid, []).append({
+                "id": shelf_id, "name": shelf_name, "slug": shelf_slug
+            })
+
+    return book_to_shelves
 
 def setup_database(conn, force_recreate=True):
     """Creates Flowise-compatible tables."""
@@ -100,7 +213,7 @@ def setup_database(conn, force_recreate=True):
             cur.execute(f"DROP TABLE IF EXISTS {DOCS_TABLE_NAME};")
             conn.commit()
 
-        # Create upserted_docs table (main content table)
+        # Create upserted_docs table
         create_docs_table_query = f"""
         CREATE TABLE IF NOT EXISTS {DOCS_TABLE_NAME} (
             id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -112,7 +225,7 @@ def setup_database(conn, force_recreate=True):
         cur.execute(create_docs_table_query)
         conn.commit()
 
-        # Create upsertion_records table (tracking table)
+        # Create upsertion_records table
         create_records_table_query = f"""
         CREATE TABLE IF NOT EXISTS {RECORDS_TABLE_NAME} (
             uuid UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -125,7 +238,7 @@ def setup_database(conn, force_recreate=True):
         cur.execute(create_records_table_query)
         conn.commit()
 
-        # Create indexes for better performance
+        # Create indexes
         index_queries = [
             f"CREATE INDEX IF NOT EXISTS idx_{DOCS_TABLE_NAME}_embedding ON {DOCS_TABLE_NAME} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);",
             f"CREATE INDEX IF NOT EXISTS idx_{RECORDS_TABLE_NAME}_namespace ON {RECORDS_TABLE_NAME}(namespace);",
@@ -176,9 +289,9 @@ def get_all_bookstack_pages():
     }
     all_pages = []
     page = 1
-    max_pages_per_request = 500
+    max_pages_per_request = 400
     consecutive_empty_pages = 0
-    max_empty_pages = 3
+    max_empty_pages = 4
 
     print("Starting to fetch all BookStack pages...")
 
@@ -273,16 +386,31 @@ def parse_bookstack_datetime(datetime_str):
         return None
 
 
-def insert_page_chunks_flowise(cur, page_details, clean_text, conn):
-    """Insert page content into Flowise-compatible tables."""
+def insert_page_chunks_flowise(cur, page_details, clean_text, conn, book_to_shelves=None):
+    """Insert page content into Flowise-compatible tables with proper book/chapter info."""
     page_id = page_details["id"]
     page_name = page_details["name"]
-    current_timestamp = time.time()  # Unix timestamp as float
+    current_timestamp = time.time()
 
-    # Create a key for this page (used in upsertion_records)
+    # Fetch book details to get the correct slug
+    book_id = page_details.get("book_id")
+    book_details = get_book_details(book_id) if book_id else None
+
+    # Fetch chapter details if chapter_id exists and is not 0
+    chapter_id = page_details.get("chapter_id")
+    chapter_details = None
+    if chapter_id and chapter_id != 0:
+        chapter_details = get_chapter_details(chapter_id)
+
+    # Create source URL with correct book slug and page slug
+    book_slug = book_details.get("slug", f"book-{book_id}") if book_details else "unknown"
+    page_slug = page_details.get("slug", f"page-{page_id}")
+    source_url = f"{BOOKSTACK_URL}/books/{book_slug}/page/{page_slug}"
+
+    # Create base key for this page
     base_key = f"bookstack_page_{page_id}"
 
-    # Delete existing records for this page from both tables
+    # Delete existing records
     cur.execute(f"DELETE FROM {RECORDS_TABLE_NAME} WHERE key LIKE %s", (f"{base_key}%",))
 
     # Get existing doc IDs to delete
@@ -318,27 +446,35 @@ def insert_page_chunks_flowise(cur, page_details, clean_text, conn):
             # Generate embedding for this chunk
             embedding = get_embedding(chunk_content)
 
-            # Create metadata for the document
+            # Create comprehensive metadata
             doc_metadata = {
-                "source": f"{BOOKSTACK_URL}/books/{page_details.get('book', {}).get('slug', 'unknown')}/page/{page_details.get('slug', 'unknown')}",
+                "source": source_url,
                 "page_id": str(page_id),
                 "page_name": page_name,
-                "book_id": str(page_details.get("book_id", "")),
-                "book_name": page_details.get("book", {}).get("name", ""),
-                "book_slug": page_details.get("book", {}).get("slug", ""),
-                "chapter_id": str(page_details.get("chapter_id", "")) if page_details.get("chapter_id") else None,
-                "chapter_name": page_details.get("chapter", {}).get("name") if page_details.get("chapter") else None,
-                "slug": page_details.get("slug", ""),
+                "page_slug": page_slug,
+                "book_id": str(book_id) if book_id else None,
+                "book_name": book_details.get("name", "") if book_details else "",
+                "book_slug": book_slug,
+                "book_description": book_details.get("description", "") if book_details else "",
+                "shelves": (book_to_shelves.get(book_id, []) if book_to_shelves else []),
+"shelf_names": ([s.get("name") for s in book_to_shelves.get(book_id, [])] if book_to_shelves else []),
+                "chapter_id": str(chapter_id) if chapter_id and chapter_id != 0 else None,
+                "chapter_name": chapter_details.get("name", "") if chapter_details else None,
+                "chapter_slug": chapter_details.get("slug", "") if chapter_details else None,
                 "created_at": page_details.get("created_at", ""),
                 "updated_at": page_details.get("updated_at", ""),
+                "created_by": page_details.get("created_by", {}),
+                "updated_by": page_details.get("updated_by", {}),
+                "owned_by": page_details.get("owned_by", {}),
                 "chunk_index": chunk_index,
                 "total_chunks": len(chunks),
                 "word_count": len(chunk_content.split()),
-                "priority": page_details.get("priority"),
+                "priority": page_details.get("priority", 0),
                 "template": page_details.get("template", False),
+                "draft": page_details.get("draft", False),
                 "revision_count": page_details.get("revision_count", 0),
                 "editor": page_details.get("editor", ""),
-                "draft": page_details.get("draft", False),
+                "tags": page_details.get("tags", []),
             }
 
             # Insert into upserted_docs table
@@ -376,9 +512,19 @@ def insert_page_chunks_flowise(cur, page_details, clean_text, conn):
     conn.commit()
     return successful_inserts, inserted_doc_ids
 
+def should_skip_book(book_id, book_to_shelves, excluded_shelf_ids):
+    """Check if a book should be skipped based on its shelves."""
+    if not excluded_shelf_ids or not book_id:
+        return False
+
+    book_shelves = book_to_shelves.get(book_id, [])
+    book_shelf_ids = [shelf.get("id") for shelf in book_shelves if shelf.get("id")]
+
+    # Skip if book belongs to any excluded shelf
+    return any(shelf_id in excluded_shelf_ids for shelf_id in book_shelf_ids)
 
 def main():
-    """Main function to run the ETL process with Flowise schema."""
+    """Main function to run the ETL process with proper book/chapter resolution."""
     print("Connecting to the database...")
 
     conn = psycopg2.connect(DB_CONNECTION_STRING)
@@ -393,6 +539,11 @@ def main():
     }
 
     try:
+        # Build shelves map (book_id -> shelves) once per run
+        with requests.Session() as _session:
+            book_to_shelves = build_book_to_shelves_map(_session)
+        print(f"Loaded shelves map for {len(book_to_shelves)} books")
+
         table_was_recreated = setup_database(conn, force_recreate=True)
         pages = get_all_bookstack_pages()
 
@@ -412,7 +563,7 @@ def main():
             print(f"\n[{i+1}/{total_pages}] Processing: '{page_name}' (ID: {page_id})")
 
             # Fetch page details
-            print("  → Fetching details...")
+            print("  → Fetching page details...")
             page_details = get_page_details(page_id)
             if not page_details:
                 print("  → FAILED (could not fetch details)")
@@ -421,8 +572,19 @@ def main():
                 )
                 continue
 
+            # Check if this page's book should be skipped
+            book_id = page_details.get("book_id")
+            if should_skip_book(book_id, book_to_shelves, EXCLUDED_SHELF_IDS):
+                book_shelves = book_to_shelves.get(book_id, [])
+                shelf_names = [s.get("name", "Unknown") for s in book_shelves]
+                print(f"  → SKIPPED (book belongs to excluded shelf(s): {', '.join(shelf_names)})")
+                processing_log["skipped"].append(
+                    {"id": page_id, "name": page_name, "book_id": book_id, "shelves": shelf_names}
+                )
+                continue
+
             # Extract and clean HTML content
-            raw_html = page_details.get("html", "")
+            raw_html = page_details.get("html", "") or page_details.get("raw_html", "")
             if not raw_html:
                 print("  → FAILED (no HTML content)")
                 processing_log["failed_no_content"].append(
@@ -444,7 +606,7 @@ def main():
 
             # Process and insert chunks
             try:
-                chunks_inserted, doc_ids = insert_page_chunks_flowise(cur, page_details, clean_text, conn)
+                chunks_inserted, doc_ids = insert_page_chunks_flowise(cur, page_details, clean_text, conn, book_to_shelves)
                 total_chunks_inserted += chunks_inserted
                 all_inserted_doc_ids.extend(doc_ids)
 
@@ -481,12 +643,9 @@ def main():
         cur.execute(f"SELECT COUNT(DISTINCT metadata->>'page_id') FROM {DOCS_TABLE_NAME}")
         unique_pages_count = cur.fetchone()[0]
 
-        # Sample a few IDs to verify
-        cur.execute(f"SELECT id FROM {DOCS_TABLE_NAME} LIMIT 3")
-        sample_doc_ids = [row[0] for row in cur.fetchall()]
-
-        cur.execute(f"SELECT uuid FROM {RECORDS_TABLE_NAME} LIMIT 3")
-        sample_record_ids = [row[0] for row in cur.fetchall()]
+        # Show some sample sources to verify correct URLs
+        cur.execute(f"SELECT metadata->>'source' FROM {DOCS_TABLE_NAME} LIMIT 5")
+        sample_sources = [row[0] for row in cur.fetchall()]
 
         cur.close()
 
@@ -496,24 +655,35 @@ def main():
         print(f"Total pages found in API: {total_pages}")
         print(f"Successfully processed pages: {len(processing_log['successful'])}")
         print(f"Total chunks/entries inserted: {total_chunks_inserted}")
+        print(f"Skipped (excluded shelves): {len(processing_log['skipped'])}")
         print(f"Failed to fetch details: {len(processing_log['failed_fetch'])}")
         print(f"Failed (no content): {len(processing_log['failed_no_content'])}")
         print(f"Failed (processing): {len(processing_log['failed_processing'])}")
         print(f"Final {DOCS_TABLE_NAME} count: {final_docs_count} entries")
         print(f"Final {RECORDS_TABLE_NAME} count: {final_records_count} entries")
         print(f"Unique pages in database: {unique_pages_count}")
+        print(f"Books cached: {len(book_cache)}")
         print(f"Namespace: {NAMESPACE}")
-        print(f"Sample doc UUIDs: {sample_doc_ids}")
-        print(f"Sample record UUIDs: {sample_record_ids}")
+
+        print(f"\nSample source URLs:")
+        for source in sample_sources:
+            print(f"  - {source}")
+
+        # Show book cache summary
+        print(f"\nCached books:")
+        for book_id, book_data in list(book_cache.items())[:10]:  # Show first 10
+            print(f"  - ID {book_id}: '{book_data.get('name', 'Unknown')}' (slug: {book_data.get('slug', 'unknown')})")
+        if len(book_cache) > 10:
+            print(f"  ... and {len(book_cache) - 10} more books")
 
         # Show detailed failures
         for category, failures in processing_log.items():
             if failures and "failed" in category:
                 print(f"\n{category.upper().replace('_', ' ')}:")
-                for failure in failures[:5]:
+                for failure in failures[:10]:
                     print(f"  - ID {failure['id']}: {failure['name']}")
-                if len(failures) > 5:
-                    print(f"  ... and {len(failures) - 5} more")
+                if len(failures) > 10:
+                    print(f"  ... and {len(failures) - 10} more")
 
     except Exception as e:
         print(f"\nCritical error: {e}")
